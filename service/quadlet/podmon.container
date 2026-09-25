@@ -4,17 +4,22 @@ After=podman.socket
 Requires=podman.socket
 
 [Container]
-Image=localhost/podmon:latest
+Image=localhost/podmon:runtime
 ContainerName=podmon
 Pull=never
 UserNS=keep-id
 User=@@UID@@
 Group=@@GID@@
+WorkingDir=/srv/podmon/service
+Exec=/opt/podmon-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+Environment=PYTHONDONTWRITEBYTECODE=1
 PublishPort=@@LAN_IP@@:8080:8080/tcp
 Volume=/run/user/@@UID@@/podman/podman.sock:/run/podman/podman.sock:ro
 @@HOST_MOUNTS@@
 ReadOnly=true
 NoNewPrivileges=true
+HealthCmd=/opt/podmon-venv/bin/python /srv/podmon/service/scripts/healthcheck.py
+HealthInterval=30s
 
 [Service]
 Restart=always

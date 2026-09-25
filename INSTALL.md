@@ -1,129 +1,172 @@
-# Установка Podmon на Ubuntu-сервере
+# Установка Podmon: сначала контейнер, затем код, затем запуск
 
-Эта инструкция устанавливает мониторинг **всех rootless Podman-контейнеров одного Linux-пользователя**. Никакие имена контейнеров и каталоги вычислений вводить в Podmon не надо. Код клонируется на сервер из GitHub по SSH deploy key, образ собирается **на сервере**, затем rootless Quadlet запускает его через user systemd. Схема `linger=yes` сохраняет user manager после SSH logout и запускает его после reboot.
+На Ubuntu-хосте используются **только уже имеющиеся Podman, user systemd/loginctl и обычная оболочка**. Не устанавливайте на хост Git, Python, pip, GCC или nginx. Весь Git, SSH client, Python и зависимости Podmon устанавливаются **в подготовительный контейнер**. Репозиторий клонируется **внутри него**. Только после этого контейнер сохраняется как image и запускается мониторинг через rootless Quadlet/systemd.
 
-Во всех командах замените `user`, `SERVER_LAN_IP`, `LAN_IP` и `LAN_SUBNET` своими значениями. Работайте от того же пользователя, который создал вычислительные контейнеры. `sudo podman` увидит другое хранилище.
+Работайте от того же Linux-пользователя, которому принадлежат вычислительные rootless-контейнеры. `sudo podman` видит другое хранилище и другие контейнеры.
 
-## 1. Проверить сервер
+## 1. Создать подготовительный контейнер на сервере
 
-Подключитесь по SSH и проверьте Podman:
+Подключитесь к серверу и проверьте Podman:
 
 ```bash
 ssh user@SERVER_LAN_IP
-whoami
-podman --version
 podman info --format 'rootless={{.Host.Security.Rootless}} cgroup={{.Host.CgroupVersion}}'
 podman ps -a
 ```
 
-Для клонирования и серверной сборки нужны Git, SSH client и сетевой доступ к GitHub, базовому образу и пакетам Python во время `podman build`. Если Git/SSH client отсутствуют:
+Создайте отдельное хранилище для SSH deploy key и сам подготовительный контейнер:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y git openssh-client
+podman volume create podmon-ssh
+podman run -d \
+  --name podmon-setup \
+  --volume podmon-ssh:/root/.ssh \
+  docker.io/library/ubuntu:24.04 \
+  sleep infinity
+podman inspect podmon-setup --format '{{.State.Status}}'
+podman exec -it podmon-setup bash
 ```
 
-Python, pip, GCC, Node.js и nginx на хосте не нужны.
+Здесь Podman скачивает **только базовый Ubuntu image в своё хранилище**, что необходимо для создания контейнера. На хост никакие пакеты не устанавливаются. PID 1 `sleep infinity` нужен только для подготовки; веб-сервис ещё не запускается.
 
-## 2. Создать ED25519 deploy key **на сервере**
+## 2. Установить всё необходимое **внутри** `podmon-setup`
 
-На сервере:
+Следующие команды выполняются в открывшейся оболочке контейнера:
 
 ```bash
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-ssh-keygen -t ed25519 -C "podmon@$(hostname)" -f "$HOME/.ssh/podmon_deploy_ed25519"
-chmod 600 "$HOME/.ssh/podmon_deploy_ed25519"
-chmod 644 "$HOME/.ssh/podmon_deploy_ed25519.pub"
-cat "$HOME/.ssh/podmon_deploy_ed25519.pub"
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  ca-certificates git openssh-client python3 python3-venv python3-pip
+python3 -m venv /opt/podmon-venv
+/opt/podmon-venv/bin/pip install \
+  fastapi==0.115.12 uvicorn==0.34.2 httpx==0.28.1
+mkdir -p /host/proc
+touch /host/proc/stat /host/proc/meminfo /host/proc/uptime /host/proc/loadavg /host/hostname
 ```
 
-Скопируйте **только содержимое `.pub`** в нужном GitHub-репозитории: `Settings → Deploy keys → Add deploy key`. Оставьте `Allow write access` выключенным. Приватный файл `podmon_deploy_ed25519` остаётся на сервере вне репозитория и никогда не передаётся в контейнер. Deploy key даёт доступ только к одному репозиторию; это штатный [механизм GitHub](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys).
+Зависимости установлены внутри будущего image. GCC не требуется для этих версий при наличии подходящих Python wheels. На хосте команды `python`, `pip`, `git` и `gcc` не используются.
 
-Добавьте SSH alias на сервере:
+## 3. Создать ED25519 ключ **внутри** контейнера и клонировать код туда же
+
+Всё ещё внутри `podmon-setup`:
 
 ```bash
-cat >> "$HOME/.ssh/config" <<'SSHCONFIG'
+chmod 700 /root/.ssh
+ssh-keygen -t ed25519 -N '' -C podmon-deploy \
+  -f /root/.ssh/podmon_deploy_ed25519
+chmod 600 /root/.ssh/podmon_deploy_ed25519
+chmod 644 /root/.ssh/podmon_deploy_ed25519.pub
+cat /root/.ssh/podmon_deploy_ed25519.pub
+```
+
+Скопируйте **только публичную строку `.pub`** в GitHub: `bullygen/PodMon → Settings → Deploy keys → Add deploy key`. `Allow write access` оставьте выключенным. Приватный ключ лежит в named volume `podmon-ssh`, **не в файловом слое контейнера**. Этот volume не будет подключён к рабочему podmon. GitHub [описывает этот порядок для deploy keys](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys).
+
+Создайте SSH alias внутри контейнера:
+
+```bash
+cat > /root/.ssh/config <<'SSHCONFIG'
 Host github-podmon
     HostName github.com
     User git
-    IdentityFile ~/.ssh/podmon_deploy_ed25519
+    IdentityFile /root/.ssh/podmon_deploy_ed25519
     IdentitiesOnly yes
 SSHCONFIG
-chmod 600 "$HOME/.ssh/config"
+chmod 600 /root/.ssh/config
 ssh -T github-podmon
 ```
 
-При первом соединении SSH покажет fingerprint `github.com`. Сравните его с [официальными fingerprint GitHub](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints) перед подтверждением. Сообщение GitHub «successfully authenticated» при `ssh -T` является ожидаемым; GitHub не предоставляет shell.
+При первом соединении сравните показанный fingerprint с [официальными fingerprint GitHub](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints) перед подтверждением. Ответ «successfully authenticated» подтверждает ключ; GitHub не предоставляет shell, поэтому `ssh -T` может завершиться кодом 1.
 
-Клонируйте код на сервере:
+Теперь **внутри контейнера** загрузите код:
 
 ```bash
-git clone git@github-podmon:bullygen/PodMon.git "$HOME/podmon-src"
-cd "$HOME/podmon-src"
+git clone git@github-podmon:bullygen/PodMon.git /srv/podmon
+cd /srv/podmon
+/opt/podmon-venv/bin/pip check
+PYTHONPATH=/srv/podmon/service /opt/podmon-venv/bin/python \
+  -m unittest discover -s service/tests -q
+exit
 ```
 
-В репозитории находятся `README.md`, `INSTALL.md` и каталог `service/`. GitHub-репозиторий `bullygen/PodMon` сейчас публичный; deploy key всё равно позволяет использовать запрошенный SSH-процесс клонирования.
+После `exit` вы снова на хосте. Мониторинг ещё не запущен.
 
-## 3. LAN firewall и запуск
+## 4. Сохранить подготовленный контейнер и включить автозапуск
 
-Укажите адрес **LAN-интерфейса сервера**. Пример ограничивающего правила UFW; подставьте настоящую подсеть и IP:
+На хосте проверьте `linger`:
+
+```bash
+loginctl show-user "$USER" -p Linger
+```
+
+Если `Linger=no`, попросите администратора выполнить `loginctl enable-linger ИМЯ_ПОЛЬЗОВАТЕЛЯ` или, если доступен sudo, выполните:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+`linger=yes` нужен user systemd, чтобы мониторинг продолжал работать после полного SSH logout и вернулся после reboot. Никакие Git/Python-пакеты для этого на хосте не нужны.
+
+Укажите адрес LAN-интерфейса сервера. Скопируйте из **подготовленного контейнера** только host-скрипт включения Quadlet и выполните его:
 
 ```bash
 LAN_IP=192.168.1.20
-LAN_SUBNET=192.168.1.0/24
-sudo ufw allow from "$LAN_SUBNET" to "$LAN_IP" port 8080 proto tcp
-sudo ufw status
+podman cp podmon-setup:/srv/podmon/service/scripts/activate_host.sh \
+  /tmp/podmon-activate-host.sh
+bash /tmp/podmon-activate-host.sh "$LAN_IP"
 ```
 
-Если UFW не используется, добавьте эквивалентное правило в существующий firewall. Не открывайте порт 8080 в Интернет. Сервис публикует HTTP только на `LAN_IP:8080`.
+Скрипт использует на хосте только Podman, systemd/loginctl и обычные shell-команды. Он проверяет код и тесты **внутри** `podmon-setup`, сохраняет файловый слой через `podman commit --include-volumes=false` в `localhost/podmon:runtime`, проверяет отсутствие приватного ключа в полученном image, создаёт user Quadlet и запускает рабочий `podmon.service`. Ключевой volume исключён из image: [Podman по умолчанию не включает содержимое подключённых volumes в commit](https://docs.podman.io/en/latest/markdown/podman-commit.1.html). После успешного запуска подготовительный контейнер останавливается; volume с ключом остаётся для будущих обновлений.
 
-В корне клонированного репозитория запустите:
+Рабочий контейнер запускает `uvicorn` как основной процесс, без интерактивного shell. Он не содержит SSH-ключ и не подключает `podmon-ssh`. Через rootless Podman Unix socket он автоматически видит **все контейнеры того же пользователя**. В его конфигурации нет списка контейнеров или путей к расчётам.
 
-```bash
-bash service/scripts/install_server.sh "$LAN_IP"
-```
+Quadlet опубликован только на `LAN_IP:8080`. Если нужен firewall, администратор должен разрешить этот порт **только доверенной LAN-подсети** в уже применяемых сетевых правилах. Не открывайте порт в Интернет и не публикуйте Podman socket по TCP.
 
-Скрипт:
+## 5. Проверка после запуска, SSH logout и reboot
 
-1. проверяет или включает `linger=yes` через `sudo loginctl enable-linger`;
-2. включает `systemctl --user enable --now podman.socket`;
-3. выполняет `podman build -t localhost/podmon:latest service` **на сервере**;
-4. пробует read-only mounts отдельных host-файлов для метрик (при неудаче оставляет их отключёнными);
-5. создаёт `~/.config/containers/systemd/podmon.container` и запускает `podmon.service`;
-6. проверяет, что Podmon читает Podman API через Unix socket.
-
-`[Install] WantedBy=default.target` включает generated Quadlet service в user default target при старте manager. Отдельное `systemctl --user enable podmon.service` для generated Quadlet обычно не поддерживается; после `daemon-reload` установщик делает `restart`, а после reboot user manager запустит сервис благодаря `linger=yes`. `Restart=always` в systemd отвечает за перезапуск после сбоя. Это соответствует [документации Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
-
-## 4. Проверить панель и автозапуск
-
-На сервере:
+На хосте:
 
 ```bash
 loginctl show-user "$USER" -p Linger
 systemctl --user status podman.socket podmon.service
 podman inspect podmon --format '{{.State.Status}}'
-bash service/scripts/smoke_test.sh "http://$LAN_IP:8080"
-bash service/scripts/survival_test.sh "$LAN_IP"
+podman healthcheck run podmon
+podman exec podmon /opt/podmon-venv/bin/python \
+  /srv/podmon/service/scripts/healthcheck.py
 ```
 
-Ожидается `Linger=yes`, `podmon.service active`, контейнер `running` и успешные проверки. Откройте `http://LAN_IP:8080/` с другого компьютера в LAN. Сравните количество и имена карточек с `podman ps -a`; найдите контейнер и команду процесса через поле поиска. Новые контейнеры появляются автоматически при следующем опросе.
+Откройте `http://LAN_IP:8080/` с компьютера в LAN. Сравните список карточек с `podman ps -a`; поле поиска принимает имя контейнера или часть команды процесса. Новые контейнеры обнаруживаются автоматически.
 
-**Обязательный тест SSH logout:** полностью выйдите из SSH (`exit`), подождите несколько минут, снова откройте панель из браузера, затем войдите по SSH и повторите команды выше. После согласованного reboot сервера повторите проверку ещё раз. Вычислительные контейнеры имеют собственную политику запуска; Podmon их не перезапускает и не меняет.
+Затем **полностью** выйдите из SSH (`exit`), подождите несколько минут, откройте панель снова и повторно войдите по SSH. Проверьте `podmon.service`, контейнер и web UI. После согласованного reboot сервера повторите проверку. Это обязательная проверка конкретного сервера; локальные тесты кода её не заменяют.
 
-## 5. Обновление с GitHub
+## 6. Обновление без Git/Python на хосте
 
-На сервере под тем же пользователем:
+На хосте запустите ранее остановленный подготовительный контейнер и войдите в него:
 
 ```bash
-cd "$HOME/podmon-src"
-git pull --ff-only
-bash service/scripts/install_server.sh "$LAN_IP"
+podman start podmon-setup
+podman exec -it podmon-setup bash
 ```
 
-Скрипт пересобирает image и перезапускает Quadlet service. Deploy key нужен только хосту для `git pull`; podmon не получает SSH-доступ.
+**Внутри** контейнера:
 
-## 6. Диагностика
+```bash
+cd /srv/podmon
+git pull --ff-only
+/opt/podmon-venv/bin/pip install -r service/requirements.txt
+PYTHONPATH=/srv/podmon/service /opt/podmon-venv/bin/python \
+  -m unittest discover -s service/tests -q
+exit
+```
+
+Затем на хосте снова извлеките актуальный скрипт и примените image:
+
+```bash
+podman cp podmon-setup:/srv/podmon/service/scripts/activate_host.sh \
+  /tmp/podmon-activate-host.sh
+bash /tmp/podmon-activate-host.sh "$LAN_IP"
+```
+
+## 7. Диагностика
 
 ```bash
 systemctl --user status podmon.service podman.socket
@@ -132,15 +175,14 @@ podman logs --tail 100 podmon
 podman ps -a
 ```
 
-- `Permission denied (publickey)` при clone: проверьте public deploy key в **этом** репозитории, SSH alias, права `~/.ssh` и `ssh -T github-podmon`.
-- `Linger=no` или podmon умирает после logout: выполните `sudo loginctl enable-linger "$USER"` и повторите полный тест выхода. Один `podman run -d` не заменяет linger.
-- `podmon.service not found`: проверьте файл `~/.config/containers/systemd/podmon.container`, затем `systemctl --user daemon-reload`; для ошибок генератора: `/usr/lib/systemd/system-generators/podman-system-generator --user --dryrun`.
-- Podman socket недоступен: проверьте `podman.socket`, UID/GID в Quadlet и `/run/user/$(id -u)/podman/podman.sock`. Если именно `:ro` socket bind не поддерживается данной версией, снимите `:ro` только с этой строки `Volume=` и повторите проверку; сам API от этого не становится read-only.
-- Панель не видит контейнеры: контейнеры должны принадлежать **тому же rootless пользователю**. `sudo podman ps -a` и `podman ps -a` показывают разные наборы.
-- Не виден процесс: `podman top` может не поддерживать расширенный формат; сервис пробует упрощённый. Проверьте `podman top ИМЯ pid,ppid,args`. Если процесс завершился, но PID 1 `sleep infinity` остался, панель покажет работающий контейнер без вычислительного кандидата.
-- Пустые логи: Podmon показывает только stdout/stderr, доступные через `podman logs`. Логи, которые программа пишет исключительно во внутренний файл, без интеграции с контейнером недоступны.
-- Нет host-метрик: установщик мог отключить read-only mounts отдельных `/proc` файлов; контейнерные CPU/RAM при этом продолжают отображаться. Диск относится к файловой системе host `/etc/hostname`.
-- Порт недоступен из LAN: проверьте `LAN_IP`, `PublishPort=`, firewall и `curl http://LAN_IP:8080/api/health` с другого компьютера.
-- На SELinux-хосте не следует вслепую применять `:Z` к Podman socket: relabel может нарушить доступ владельца. Сначала проверьте UNIX-права и AVC audit.
+- `git` или `python` не найден на **хосте**: это ожидаемо; команды установки, ключа и `git clone` нужно выполнять внутри `podmon-setup`.
+- `Permission denied (publickey)`: ключ и SSH alias проверяйте **внутри** `podmon-setup`; в GitHub добавляется только `.pub`.
+- `Linger=no` или podmon умирает после logout: включите linger для rootless пользователя и повторите тест выхода.
+- `podmon.service not found`: проверьте `~/.config/containers/systemd/podmon.container` и `systemctl --user daemon-reload`. Quadlet использует `[Install] WantedBy=default.target`; generated service обычно не нужно отдельно `enable`.
+- Socket недоступен: проверьте `podman.socket` и `/run/user/$(id -u)/podman/podman.sock`. `:ro` на socket не ограничивает полномочия Podman API; если именно bind с `:ro` не работает на версии Podman, измените только эту строку Quadlet и повторите проверку.
+- Панель не видит контейнеры: rootless контейнеры должны принадлежать тому же Linux-пользователю; `sudo podman` показывает другой набор.
+- Нет процессов: сервис пробует расширенный и упрощённый `podman top`. `sleep infinity` может жить после окончания вычисления; отсутствие кандидата не доказывает аварию.
+- Пустые логи: автоматически доступны только stdout/stderr из `podman logs`, не произвольные файлы внутри других контейнеров.
+- Нет host-метрик: отдельные read-only mounts `/proc` могли не пройти проверку; контейнерные CPU/RAM продолжат отображаться.
 
-Podmon не публикует Podman API по TCP. Приватные ключи, токены и пароли сервису не нужны.
+На хосте остаются только Podman и systemd для создания и автозапуска контейнера. Все пакеты приложения и GitHub-доступ находятся в подготовительном контейнере; приватный ключ не попадает в рабочий image.

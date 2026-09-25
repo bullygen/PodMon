@@ -21,9 +21,11 @@ Podmon — веб-панель для **всех контейнеров теку
 
 ## Установка
 
-Полная инструкция: [INSTALL.md](INSTALL.md). Код клонируется из GitHub-репозитория `bullygen/PodMon` на сервер с помощью ED25519 deploy key, созданного **на сервере**. Образ собирается там же командой `podman build`, которую выполняет установщик. На серверном хосте не нужны Python, pip или компилятор: зависимости устанавливаются внутрь образа при сборке. Понадобятся Git, SSH client, Podman, user systemd и доступ к registry/PyPI на время сборки.
+Полная [пошаговая инструкция](INSTALL.md): на сервере сначала создаётся `podmon-setup` из Ubuntu. **Внутри** него устанавливаются Git, SSH client, Python, venv и зависимости. Там же создаётся ED25519 deploy key в отдельном named volume, после чего репозиторий `bullygen/PodMon` клонируется **внутрь контейнера**. Мониторинг до этого момента не запускается.
 
-Основной запуск — [rootless Quadlet](service/quadlet/podmon.container) с `WantedBy=default.target`, `Restart=always` и `linger=yes`. Мониторинг продолжает работать после полного SSH logout и должен запускаться после reboot. Установщик проверяет доступ podmon к Unix socket. Фактическое переживание logout и reboot следует проверить на целевом сервере по [инструкции](INSTALL.md).
+После клонирования Podman сохраняет файловый слой подготовительного контейнера в image без подключённого key-volume. User [Quadlet](service/quadlet/podmon.container) запускает из этого image рабочий `podmon` с `uvicorn` как основным процессом. На хосте нужны только уже установленные Podman и user systemd/loginctl; Git, Python, pip, GCC и сервисы приложения на хост не устанавливаются.
+
+`WantedBy=default.target`, `Restart=always` и `linger=yes` обеспечивают фоновую работу после SSH logout и автозапуск после reboot. Доступ к Podman socket и фактическое переживание logout/reboot проверяются на целевом сервере по инструкции.
 
 ## Значение индикаторов
 
@@ -37,17 +39,17 @@ CPU контейнера может быть больше 100% на многоп
 
 `GET /api/health`, `/api/host`, `/api/containers`, `/api/containers/{name}`, `/api/containers/{name}/processes`, `/api/containers/{name}/log`. Запросы браузера читают кэшированный snapshot; они не запускают опрос Podman. Лог доступен только для обнаруженного контейнера. Mutating API и универсального прокси к Podman нет.
 
-Podman socket технически даёт полный контроль над контейнерами своему владельцу. Read-only bind mount `:ro` не делает сам API read-only; безопасность обеспечивается ограниченным кодом сервиса и доступом к UI только из доверенной LAN. HTTP-порт привязывается к указанному LAN IP и дополнительно ограничивается firewall. Не публикуйте Podman socket через TCP. Приватный SSH deploy key остаётся только на хосте и **не** монтируется в podmon.
+Podman socket технически даёт полный контроль над контейнерами своему владельцу. Read-only bind mount `:ro` не делает сам API read-only; безопасность обеспечивается ограниченным кодом сервиса и доступом к UI только из доверенной LAN. HTTP-порт привязывается к указанному LAN IP и дополнительно ограничивается firewall. Не публикуйте Podman socket через TCP. Приватный SSH deploy key хранится в отдельном named volume подготовительного контейнера; в рабочий image и контейнер podmon он **не** попадает.
 
 ## Проверка кода
 
-На рабочей машине с Python (серверный хост для этого не нужен):
+После клонирования проекта команды запускаются **внутри** `podmon-setup`:
 
 ```bash
-python3 -m venv /tmp/podmon-test-venv
-/tmp/podmon-test-venv/bin/pip install -r service/requirements.txt
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=service /tmp/podmon-test-venv/bin/python -m unittest discover -s service/tests -v
+cd /srv/podmon
+PYTHONPATH=/srv/podmon/service /opt/podmon-venv/bin/python \
+  -m unittest discover -s service/tests -v
 bash -n service/scripts/*.sh
 ```
 
-Исходники и тесты находятся в `service/`; серверная установка описана в `INSTALL.md`.
+Исходники и тесты находятся в `service/`. На хосте Python для проверки не нужен.
