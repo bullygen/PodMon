@@ -1,0 +1,25 @@
+[Unit]
+Description=Podmon - all rootless Podman containers
+After=podman.socket
+Requires=podman.socket
+
+[Container]
+Image=localhost/podmon:latest
+ContainerName=podmon
+Pull=never
+UserNS=keep-id
+User=@@UID@@
+Group=@@GID@@
+PublishPort=@@LAN_IP@@:8080:8080/tcp
+Volume=/run/user/@@UID@@/podman/podman.sock:/run/podman/podman.sock:ro
+@@HOST_MOUNTS@@
+ReadOnly=true
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target
